@@ -1,8 +1,6 @@
 name: Build iOS IPA (Unsigned)
 
 # ─── Triggers ──────────────────────────────────────────────────────────────────
-# Runs on every push/PR to return-ios, and can be triggered manually via the
-# GitHub Actions UI ("Run workflow") for ad-hoc testing.
 on:
   push:
     branches: [ return-ios ]
@@ -30,27 +28,35 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: return-ios
-          # Full history isn't needed for a pure build job.
           fetch-depth: 1
 
       # ── 2. Toolchain ──────────────────────────────────────────────────────────
-      - name: Set up JDK 21
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
-          # Unciv's build.gradle.kts sets sourceCompatibility = VERSION_21,
-          # so the JDK running Gradle must be >= 21.
-          java-version: '21'
+          # ⚠️  Must be JDK 17, NOT 21.
+          #
+          # The return-ios branch pins Gradle 8.2 (August 2023). Gradle 8.2
+          # ships buildSrc's kotlin-dsl plugin with KGP 1.9.0, whose JvmTarget
+          # enum only has entries up to JVM_20. JVM_21 was added in KGP 1.9.20
+          # (November 2023). When JDK 21 is the Gradle toolchain, Kotlin calls
+          # JvmTarget.fromTarget("21"), which throws:
+          #
+          #   java.lang.IllegalArgumentException: Unknown Kotlin JVM target: 21
+          #   at org.jetbrains.kotlin.gradle.dsl.JvmTarget$Companion.fromTarget
+          #   Execution failed for task ':buildSrc:compileKotlin'
+          #
+          # JDK 17 wires to JvmTarget.JVM_17, which KGP 1.9.0 supports.
+          # RoboVM also has better-tested support against JDK 17 bytecode.
+          java-version: '17'
           distribution: 'temurin'
           # This built-in cache covers ~/.gradle/wrapper and ~/.gradle/caches.
-          # The RoboVM cache (~/.robovm) is handled separately below because
-          # it's large and has different invalidation characteristics.
+          # The RoboVM cache (~/.robovm) is handled separately below.
           cache: gradle
 
       - name: Set up Android SDK
         # Gradle evaluates *all* subprojects (including android) even when only
         # ios:createIPA is invoked, so the Android SDK must be present.
-        # macos-14 runners ship with the SDK; this action ensures licences are
-        # accepted and the SDK location is exported as ANDROID_HOME.
         uses: android-actions/setup-android@v3
 
       # ── 3. Caching ────────────────────────────────────────────────────────────
@@ -58,13 +64,10 @@ jobs:
         # RoboVM ahead-of-time-compiles every class in the classpath (your code
         # + LibGDX + all transitive deps) to ARM64 machine code via LLVM.
         # Without this cache the first run routinely takes 45–90 minutes.
-        # Subsequent runs hit the cache and finish in a few minutes.
+        # Subsequent warm-cache runs finish in a few minutes.
         uses: actions/cache@v4
         with:
           path: ~/.robovm/cache
-          # Invalidate when the RoboVM config files or Gradle wrapper change.
-          # The ios/build.gradle* and robovm.xml govern which classes are
-          # compiled and with which settings.
           key: robovm-${{ runner.os }}-${{ hashFiles(
                  'gradle/wrapper/gradle-wrapper.properties',
                  'buildSrc/**',
@@ -87,19 +90,16 @@ jobs:
       # ── 5. Inject unsigned-build setting ──────────────────────────────────────
       - name: Write Gradle init script to skip code signing
         # We inject iosSkipSigning = true via a Gradle user-level init script
-        # rather than modifying any project-owned file.  Init scripts run
-        # before any build script, so this overrides whatever the project
-        # sets.  The equivalent manual change would be:
+        # rather than modifying any project-owned file. Init scripts run before
+        # any build script, so this overrides whatever the project may set.
+        # The equivalent manual change in ios/build.gradle would be:
         #
-        #   project(":ios") {
-        #       robovm { iosSkipSigning = true }
-        #   }
+        #   robovm { iosSkipSigning = true }
         #
         # With iosSkipSigning = true the RoboVM Gradle plugin passes
         #   CODE_SIGN_IDENTITY=""  CODE_SIGNING_REQUIRED=NO
         # to the underlying xcodebuild invocation, producing a valid but
-        # un-signed IPA that can be side-loaded with AltStore / Sideloadly /
-        # a personal development certificate, or examined for CI verification.
+        # unsigned IPA sideloadable via AltStore / Sideloadly / a personal cert.
         run: |
           mkdir -p ~/.gradle/init.d
           cat > ~/.gradle/init.d/skip-ios-signing.gradle << 'INIT_SCRIPT'
@@ -122,16 +122,11 @@ jobs:
         #   1. Runs the RoboVM AOT compiler (Kotlin/Java → ARM64 native)
         #   2. Places native output in ios/xcode/native/
         #   3. Invokes xcodebuild to archive and package the IPA
-        #
-        # If the branch renamed the task or uses a custom one, check
-        # `./gradlew ios:tasks --all` for alternatives such as:
-        #   ios:launchIOSDevice      (requires attached device, not usable in CI)
-        #   ios:robovmInstall        (install only, no IPA)
         run: |
           ./gradlew ios:createIPA \
             --no-daemon \
             --stacktrace
-        # 90 min covers a cold run with empty RoboVM cache.  Warm cache runs
+        # 90 min covers a cold run with an empty RoboVM cache. Warm cache runs
         # typically complete in under 15 minutes.
         timeout-minutes: 90
 
@@ -164,12 +159,9 @@ jobs:
       - name: Upload unsigned IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          # Include the short SHA so parallel runs on different commits don't
-          # clobber each other in the artifacts list.
           name: Unciv-iOS-unsigned-${{ github.sha }}
           path: ${{ steps.ipa.outputs.path }}
           if-no-files-found: error
-          # Keep for two weeks; adjust to taste.
           retention-days: 14
 
       # ── 9. Debug dump (failure only) ──────────────────────────────────────────
