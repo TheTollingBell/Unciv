@@ -8,8 +8,6 @@ on:
     branches: [ return-ios ]
   workflow_dispatch:
 
-# Cancel any in-progress run for the same ref so pushes don't queue behind each
-# other (especially important given RoboVM's long compile times).
 concurrency:
   group: ios-build-${{ github.ref }}
   cancel-in-progress: true
@@ -18,9 +16,7 @@ concurrency:
 jobs:
   build-ios:
     name: Build unsigned iOS IPA
-    # iOS builds require macOS + Xcode. macos-14 is Apple Silicon (arm64) with
-    # Xcode 15, matching the arm64 target architecture of modern iOS devices.
-    runs-on: macos-14
+    runs-on: macos-14   # Apple Silicon, Xcode 15
 
     steps:
       # ── 1. Source ─────────────────────────────────────────────────────────────
@@ -37,34 +33,27 @@ jobs:
           # ⚠️  Must be JDK 17, NOT 21.
           #
           # The return-ios branch pins Gradle 8.2 (August 2023). Gradle 8.2
-          # ships buildSrc's kotlin-dsl plugin with KGP 1.9.0, whose JvmTarget
-          # enum only has entries up to JVM_20. JVM_21 was added in KGP 1.9.20
-          # (November 2023). When JDK 21 is the Gradle toolchain, Kotlin calls
-          # JvmTarget.fromTarget("21"), which throws:
-          #
-          #   java.lang.IllegalArgumentException: Unknown Kotlin JVM target: 21
-          #   at org.jetbrains.kotlin.gradle.dsl.JvmTarget$Companion.fromTarget
-          #   Execution failed for task ':buildSrc:compileKotlin'
+          # ships buildSrc's kotlin-dsl plugin using KGP 1.9.0, whose JvmTarget
+          # enum only covers up to JVM_20.  JVM_21 was added in KGP 1.9.20
+          # (November 2023).  With JDK 21 as the toolchain, Kotlin calls
+          # JvmTarget.fromTarget("21") → IllegalArgumentException:
+          #   "Unknown Kotlin JVM target: 21"
+          #   Task :buildSrc:compileKotlin FAILED
           #
           # JDK 17 wires to JvmTarget.JVM_17, which KGP 1.9.0 supports.
-          # RoboVM also has better-tested support against JDK 17 bytecode.
           java-version: '17'
           distribution: 'temurin'
-          # This built-in cache covers ~/.gradle/wrapper and ~/.gradle/caches.
-          # The RoboVM cache (~/.robovm) is handled separately below.
-          cache: gradle
+          cache: gradle   # covers ~/.gradle/wrapper and ~/.gradle/caches
 
       - name: Set up Android SDK
-        # Gradle evaluates *all* subprojects (including android) even when only
-        # ios:createIPA is invoked, so the Android SDK must be present.
+        # Gradle evaluates all subprojects (including :android) even when only
+        # ios:createIPA is requested, so ANDROID_HOME must be present.
         uses: android-actions/setup-android@v3
 
       # ── 3. Caching ────────────────────────────────────────────────────────────
       - name: Cache RoboVM AOT compilation output
-        # RoboVM ahead-of-time-compiles every class in the classpath (your code
-        # + LibGDX + all transitive deps) to ARM64 machine code via LLVM.
-        # Without this cache the first run routinely takes 45–90 minutes.
-        # Subsequent warm-cache runs finish in a few minutes.
+        # RoboVM AOT-compiles every class in the classpath to ARM64 via LLVM.
+        # Without this cache the first run takes 45–90 min. Warm runs: ~15 min.
         uses: actions/cache@v4
         with:
           path: ~/.robovm/cache
@@ -84,22 +73,31 @@ jobs:
         run: chmod +x gradlew
 
       - name: Show Xcode version
-        # Confirms which Xcode toolchain RoboVM will use for the final link.
         run: xcodebuild -version
 
-      # ── 5. Inject unsigned-build setting ──────────────────────────────────────
+      # ── 5. Downgrade RoboVM plugin validation errors to warnings ──────────────
+      - name: Patch gradle.properties for RoboVM / Gradle 8.x compatibility
+        run: |
+          # The RoboVM Gradle plugin's ArchiveTask has an unannotated field
+          # 'roboVMLogger'. In Gradle 7.x this was harmless; in Gradle 8.0+
+          # unannotated task properties cause a hard WorkValidationException:
+          #
+          #   "property 'roboVMLogger' is missing an input or output annotation"
+          #   org.gradle.internal.execution.WorkValidationException
+          #   BUILD FAILED: A problem was found with the configuration of
+          #   task ':ios:createIPA' (type 'ArchiveTask')
+          #
+          # The Gradle 8.0 upgrade guide documents org.gradle.warning.mode=all
+          # as the supported workaround to convert these validation errors back
+          # to warnings while the upstream plugin is unpatched.
+          echo "org.gradle.warning.mode=all" >> gradle.properties
+
+      # ── 6. Inject iosSkipSigning ───────────────────────────────────────────
       - name: Write Gradle init script to skip code signing
-        # We inject iosSkipSigning = true via a Gradle user-level init script
-        # rather than modifying any project-owned file. Init scripts run before
-        # any build script, so this overrides whatever the project may set.
-        # The equivalent manual change in ios/build.gradle would be:
-        #
-        #   robovm { iosSkipSigning = true }
-        #
-        # With iosSkipSigning = true the RoboVM Gradle plugin passes
-        #   CODE_SIGN_IDENTITY=""  CODE_SIGNING_REQUIRED=NO
-        # to the underlying xcodebuild invocation, producing a valid but
-        # unsigned IPA sideloadable via AltStore / Sideloadly / a personal cert.
+        # A user-level init script avoids touching any project file.
+        # It runs before any build script and sets iosSkipSigning = true on
+        # every project that has the RoboVM plugin, which causes the plugin to
+        # pass CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO to xcodebuild.
         run: |
           mkdir -p ~/.gradle/init.d
           cat > ~/.gradle/init.d/skip-ios-signing.gradle << 'INIT_SCRIPT'
@@ -116,28 +114,20 @@ jobs:
           }
           INIT_SCRIPT
 
-      # ── 6. Build ──────────────────────────────────────────────────────────────
+      # ── 7. Build ──────────────────────────────────────────────────────────────
       - name: Build unsigned iOS IPA
-        # ios:createIPA is the standard LibGDX/RoboVM task that:
-        #   1. Runs the RoboVM AOT compiler (Kotlin/Java → ARM64 native)
-        #   2. Places native output in ios/xcode/native/
-        #   3. Invokes xcodebuild to archive and package the IPA
         run: |
           ./gradlew ios:createIPA \
             --no-daemon \
             --stacktrace
-        # 90 min covers a cold run with an empty RoboVM cache. Warm cache runs
-        # typically complete in under 15 minutes.
-        timeout-minutes: 90
+        timeout-minutes: 90   # AOT compile is slow on first (cache-miss) run
 
-      # ── 7. Locate the IPA ─────────────────────────────────────────────────────
+      # ── 8. Locate the IPA ─────────────────────────────────────────────────────
       - name: Locate generated IPA
         id: ipa
         run: |
-          # RoboVM's default output is ios/build/robovm/<AppName>.ipa
           IPA_PATH=$(find ios/build/robovm -name "*.ipa" 2>/dev/null | head -1)
 
-          # Fallback: search the whole workspace if the default path differs.
           if [ -z "$IPA_PATH" ]; then
             IPA_PATH=$(find . -name "*.ipa" \
               -not -path "*/.git/*" \
@@ -155,7 +145,7 @@ jobs:
           echo "path=$IPA_PATH" >> "$GITHUB_OUTPUT"
           echo "::notice::IPA produced: $IPA_PATH ($IPA_SIZE)"
 
-      # ── 8. Upload ─────────────────────────────────────────────────────────────
+      # ── 9. Upload ─────────────────────────────────────────────────────────────
       - name: Upload unsigned IPA artifact
         uses: actions/upload-artifact@v4
         with:
@@ -164,7 +154,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      # ── 9. Debug dump (failure only) ──────────────────────────────────────────
+      # ── 10. Debug dump (failure only) ─────────────────────────────────────────
       - name: Upload build logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
