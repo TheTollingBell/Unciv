@@ -1,0 +1,185 @@
+name: Build iOS IPA (Unsigned)
+
+# ─── Triggers ──────────────────────────────────────────────────────────────────
+# Runs on every push/PR to return-ios, and can be triggered manually via the
+# GitHub Actions UI ("Run workflow") for ad-hoc testing.
+on:
+  push:
+    branches: [ return-ios ]
+  pull_request:
+    branches: [ return-ios ]
+  workflow_dispatch:
+
+# Cancel any in-progress run for the same ref so pushes don't queue behind each
+# other (especially important given RoboVM's long compile times).
+concurrency:
+  group: ios-build-${{ github.ref }}
+  cancel-in-progress: true
+
+# ─── Job ───────────────────────────────────────────────────────────────────────
+jobs:
+  build-ios:
+    name: Build unsigned iOS IPA
+    # iOS builds require macOS + Xcode. macos-14 is Apple Silicon (arm64) with
+    # Xcode 15, matching the arm64 target architecture of modern iOS devices.
+    runs-on: macos-14
+
+    steps:
+      # ── 1. Source ─────────────────────────────────────────────────────────────
+      - name: Checkout return-ios branch
+        uses: actions/checkout@v4
+        with:
+          ref: return-ios
+          # Full history isn't needed for a pure build job.
+          fetch-depth: 1
+
+      # ── 2. Toolchain ──────────────────────────────────────────────────────────
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          # Unciv's build.gradle.kts sets sourceCompatibility = VERSION_21,
+          # so the JDK running Gradle must be >= 21.
+          java-version: '21'
+          distribution: 'temurin'
+          # This built-in cache covers ~/.gradle/wrapper and ~/.gradle/caches.
+          # The RoboVM cache (~/.robovm) is handled separately below because
+          # it's large and has different invalidation characteristics.
+          cache: gradle
+
+      - name: Set up Android SDK
+        # Gradle evaluates *all* subprojects (including android) even when only
+        # ios:createIPA is invoked, so the Android SDK must be present.
+        # macos-14 runners ship with the SDK; this action ensures licences are
+        # accepted and the SDK location is exported as ANDROID_HOME.
+        uses: android-actions/setup-android@v3
+
+      # ── 3. Caching ────────────────────────────────────────────────────────────
+      - name: Cache RoboVM AOT compilation output
+        # RoboVM ahead-of-time-compiles every class in the classpath (your code
+        # + LibGDX + all transitive deps) to ARM64 machine code via LLVM.
+        # Without this cache the first run routinely takes 45–90 minutes.
+        # Subsequent runs hit the cache and finish in a few minutes.
+        uses: actions/cache@v4
+        with:
+          path: ~/.robovm/cache
+          # Invalidate when the RoboVM config files or Gradle wrapper change.
+          # The ios/build.gradle* and robovm.xml govern which classes are
+          # compiled and with which settings.
+          key: robovm-${{ runner.os }}-${{ hashFiles(
+                 'gradle/wrapper/gradle-wrapper.properties',
+                 'buildSrc/**',
+                 'ios/build.gradle',
+                 'ios/build.gradle.kts',
+                 'ios/robovm.xml',
+                 'ios/robovm.properties'
+               ) }}
+          restore-keys: |
+            robovm-${{ runner.os }}-
+
+      # ── 4. Pre-flight ─────────────────────────────────────────────────────────
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      - name: Show Xcode version
+        # Confirms which Xcode toolchain RoboVM will use for the final link.
+        run: xcodebuild -version
+
+      # ── 5. Inject unsigned-build setting ──────────────────────────────────────
+      - name: Write Gradle init script to skip code signing
+        # We inject iosSkipSigning = true via a Gradle user-level init script
+        # rather than modifying any project-owned file.  Init scripts run
+        # before any build script, so this overrides whatever the project
+        # sets.  The equivalent manual change would be:
+        #
+        #   project(":ios") {
+        #       robovm { iosSkipSigning = true }
+        #   }
+        #
+        # With iosSkipSigning = true the RoboVM Gradle plugin passes
+        #   CODE_SIGN_IDENTITY=""  CODE_SIGNING_REQUIRED=NO
+        # to the underlying xcodebuild invocation, producing a valid but
+        # un-signed IPA that can be side-loaded with AltStore / Sideloadly /
+        # a personal development certificate, or examined for CI verification.
+        run: |
+          mkdir -p ~/.gradle/init.d
+          cat > ~/.gradle/init.d/skip-ios-signing.gradle << 'INIT_SCRIPT'
+          allprojects {
+              afterEvaluate { proj ->
+                  if (proj.plugins.hasPlugin("robovm")) {
+                      def robovmExt = proj.extensions.findByName("robovm")
+                      if (robovmExt != null) {
+                          robovmExt.iosSkipSigning = true
+                          logger.lifecycle("[CI] Forced iosSkipSigning=true on project '${proj.name}'")
+                      }
+                  }
+              }
+          }
+          INIT_SCRIPT
+
+      # ── 6. Build ──────────────────────────────────────────────────────────────
+      - name: Build unsigned iOS IPA
+        # ios:createIPA is the standard LibGDX/RoboVM task that:
+        #   1. Runs the RoboVM AOT compiler (Kotlin/Java → ARM64 native)
+        #   2. Places native output in ios/xcode/native/
+        #   3. Invokes xcodebuild to archive and package the IPA
+        #
+        # If the branch renamed the task or uses a custom one, check
+        # `./gradlew ios:tasks --all` for alternatives such as:
+        #   ios:launchIOSDevice      (requires attached device, not usable in CI)
+        #   ios:robovmInstall        (install only, no IPA)
+        run: |
+          ./gradlew ios:createIPA \
+            --no-daemon \
+            --stacktrace
+        # 90 min covers a cold run with empty RoboVM cache.  Warm cache runs
+        # typically complete in under 15 minutes.
+        timeout-minutes: 90
+
+      # ── 7. Locate the IPA ─────────────────────────────────────────────────────
+      - name: Locate generated IPA
+        id: ipa
+        run: |
+          # RoboVM's default output is ios/build/robovm/<AppName>.ipa
+          IPA_PATH=$(find ios/build/robovm -name "*.ipa" 2>/dev/null | head -1)
+
+          # Fallback: search the whole workspace if the default path differs.
+          if [ -z "$IPA_PATH" ]; then
+            IPA_PATH=$(find . -name "*.ipa" \
+              -not -path "*/.git/*" \
+              -not -path "*/robovm-build/tmp/*" \
+              2>/dev/null | head -1)
+          fi
+
+          if [ -z "$IPA_PATH" ]; then
+            echo "::error::No .ipa file was produced. Build output:"
+            find ios/build -type f 2>/dev/null | head -40 || echo "(ios/build is empty)"
+            exit 1
+          fi
+
+          IPA_SIZE=$(du -h "$IPA_PATH" | cut -f1)
+          echo "path=$IPA_PATH" >> "$GITHUB_OUTPUT"
+          echo "::notice::IPA produced: $IPA_PATH ($IPA_SIZE)"
+
+      # ── 8. Upload ─────────────────────────────────────────────────────────────
+      - name: Upload unsigned IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # Include the short SHA so parallel runs on different commits don't
+          # clobber each other in the artifacts list.
+          name: Unciv-iOS-unsigned-${{ github.sha }}
+          path: ${{ steps.ipa.outputs.path }}
+          if-no-files-found: error
+          # Keep for two weeks; adjust to taste.
+          retention-days: 14
+
+      # ── 9. Debug dump (failure only) ──────────────────────────────────────────
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.sha }}
+          path: |
+            ios/build/
+            ~/.robovm/logs/
+          retention-days: 3
+          if-no-files-found: ignore
