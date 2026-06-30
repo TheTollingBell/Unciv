@@ -1,6 +1,5 @@
 name: Build iOS IPA (Unsigned)
 
-# ─── Triggers ──────────────────────────────────────────────────────────────────
 on:
   push:
     branches: [ return-ios ]
@@ -12,7 +11,6 @@ concurrency:
   group: ios-build-${{ github.ref }}
   cancel-in-progress: true
 
-# ─── Job ───────────────────────────────────────────────────────────────────────
 jobs:
   build-ios:
     name: Build unsigned iOS IPA
@@ -32,35 +30,32 @@ jobs:
         with:
           # ⚠️  Must be JDK 17, NOT 21.
           #
-          # The return-ios branch pins Gradle 8.2 (August 2023). Gradle 8.2
-          # ships buildSrc's kotlin-dsl plugin using KGP 1.9.0, whose JvmTarget
-          # enum only covers up to JVM_20.  JVM_21 was added in KGP 1.9.20
-          # (November 2023).  With JDK 21 as the toolchain, Kotlin calls
-          # JvmTarget.fromTarget("21") → IllegalArgumentException:
+          # The return-ios branch pins Gradle 8.2, which ships buildSrc's
+          # kotlin-dsl plugin using KGP 1.9.0. That version's JvmTarget enum
+          # only goes up to JVM_20; JVM_21 was added in KGP 1.9.20. With JDK 21
+          # as the toolchain, Kotlin calls JvmTarget.fromTarget("21") and throws:
           #   "Unknown Kotlin JVM target: 21"
           #   Task :buildSrc:compileKotlin FAILED
-          #
-          # JDK 17 wires to JvmTarget.JVM_17, which KGP 1.9.0 supports.
+          # JDK 17 wires to JvmTarget.JVM_17, supported by all KGP 1.x versions.
           java-version: '17'
           distribution: 'temurin'
-          cache: gradle   # covers ~/.gradle/wrapper and ~/.gradle/caches
+          cache: gradle
 
       - name: Set up Android SDK
         # Gradle evaluates all subprojects (including :android) even when only
-        # ios:createIPA is requested, so ANDROID_HOME must be present.
+        # ios:createIPA is invoked, so ANDROID_HOME must be present.
         uses: android-actions/setup-android@v3
 
       # ── 3. Caching ────────────────────────────────────────────────────────────
       - name: Cache RoboVM AOT compilation output
         # RoboVM AOT-compiles every class in the classpath to ARM64 via LLVM.
-        # Without this cache the first run takes 45–90 min. Warm runs: ~15 min.
+        # Without this cache the first run takes 45–90 min; warm runs ~15 min.
         uses: actions/cache@v4
         with:
           path: ~/.robovm/cache
           key: robovm-${{ runner.os }}-${{ hashFiles(
                  'gradle/wrapper/gradle-wrapper.properties',
                  'buildSrc/**',
-                 'ios/build.gradle',
                  'ios/build.gradle.kts',
                  'ios/robovm.xml',
                  'ios/robovm.properties'
@@ -75,29 +70,12 @@ jobs:
       - name: Show Xcode version
         run: xcodebuild -version
 
-      # ── 5. Downgrade RoboVM plugin validation errors to warnings ──────────────
-      - name: Patch gradle.properties for RoboVM / Gradle 8.x compatibility
-        run: |
-          # The RoboVM Gradle plugin's ArchiveTask has an unannotated field
-          # 'roboVMLogger'. In Gradle 7.x this was harmless; in Gradle 8.0+
-          # unannotated task properties cause a hard WorkValidationException:
-          #
-          #   "property 'roboVMLogger' is missing an input or output annotation"
-          #   org.gradle.internal.execution.WorkValidationException
-          #   BUILD FAILED: A problem was found with the configuration of
-          #   task ':ios:createIPA' (type 'ArchiveTask')
-          #
-          # The Gradle 8.0 upgrade guide documents org.gradle.warning.mode=all
-          # as the supported workaround to convert these validation errors back
-          # to warnings while the upstream plugin is unpatched.
-          echo "org.gradle.warning.mode=all" >> gradle.properties
-
-      # ── 6. Inject iosSkipSigning ───────────────────────────────────────────
+      # ── 5. Inject iosSkipSigning ──────────────────────────────────────────────
       - name: Write Gradle init script to skip code signing
         # A user-level init script avoids touching any project file.
-        # It runs before any build script and sets iosSkipSigning = true on
-        # every project that has the RoboVM plugin, which causes the plugin to
-        # pass CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO to xcodebuild.
+        # Sets iosSkipSigning = true on every project with the RoboVM plugin,
+        # which makes the plugin pass CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO
+        # to xcodebuild, producing a valid unsigned IPA.
         run: |
           mkdir -p ~/.gradle/init.d
           cat > ~/.gradle/init.d/skip-ios-signing.gradle << 'INIT_SCRIPT'
@@ -114,38 +92,35 @@ jobs:
           }
           INIT_SCRIPT
 
-      # ── 7. Build ──────────────────────────────────────────────────────────────
+      # ── 6. Build ──────────────────────────────────────────────────────────────
       - name: Build unsigned iOS IPA
         run: |
           ./gradlew ios:createIPA \
             --no-daemon \
             --stacktrace
-        timeout-minutes: 90   # AOT compile is slow on first (cache-miss) run
+        timeout-minutes: 90
 
-      # ── 8. Locate the IPA ─────────────────────────────────────────────────────
+      # ── 7. Locate the IPA ─────────────────────────────────────────────────────
       - name: Locate generated IPA
         id: ipa
         run: |
           IPA_PATH=$(find ios/build/robovm -name "*.ipa" 2>/dev/null | head -1)
-
           if [ -z "$IPA_PATH" ]; then
             IPA_PATH=$(find . -name "*.ipa" \
               -not -path "*/.git/*" \
               -not -path "*/robovm-build/tmp/*" \
               2>/dev/null | head -1)
           fi
-
           if [ -z "$IPA_PATH" ]; then
             echo "::error::No .ipa file was produced. Build output:"
             find ios/build -type f 2>/dev/null | head -40 || echo "(ios/build is empty)"
             exit 1
           fi
-
           IPA_SIZE=$(du -h "$IPA_PATH" | cut -f1)
           echo "path=$IPA_PATH" >> "$GITHUB_OUTPUT"
           echo "::notice::IPA produced: $IPA_PATH ($IPA_SIZE)"
 
-      # ── 9. Upload ─────────────────────────────────────────────────────────────
+      # ── 8. Upload ─────────────────────────────────────────────────────────────
       - name: Upload unsigned IPA artifact
         uses: actions/upload-artifact@v4
         with:
@@ -154,7 +129,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      # ── 10. Debug dump (failure only) ─────────────────────────────────────────
+      # ── 9. Debug dump (failure only) ──────────────────────────────────────────
       - name: Upload build logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
